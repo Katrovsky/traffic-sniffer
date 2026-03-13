@@ -174,7 +174,7 @@ func (m model) View() string {
 }
 
 func (m *model) openLog(app string) {
-	ts := time.Now().Format("20060102_150405")
+	ts := time.Now().Format("150405_02.01.06")
 	m.logPath = fmt.Sprintf("nettracer_%s_%s.log", app, ts)
 	f, err := os.Create(m.logPath)
 	if err != nil {
