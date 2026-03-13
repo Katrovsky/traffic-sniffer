@@ -22,11 +22,11 @@ func splitAddress(addr string) (string, string) {
 }
 
 func extractPidFromSS(line string) int {
-	idx := strings.Index(line, "pid=")
-	if idx == -1 {
+	_, after, ok := strings.Cut(line, "pid=")
+	if !ok {
 		return 0
 	}
-	sub := line[idx+4:]
+	sub := after
 	end := strings.IndexFunc(sub, func(r rune) bool { return r < '0' || r > '9' })
 	if end == -1 {
 		end = len(sub)

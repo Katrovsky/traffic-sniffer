@@ -16,7 +16,7 @@ import (
 type phase int
 
 const (
-	phaseSelect  phase = iota
+	phaseSelect phase = iota
 	phaseMonitor
 )
 
@@ -33,14 +33,14 @@ type connRow struct {
 }
 
 const (
-	colWidthIP       = 18
-	colWidthPort     = 6
-	colWidthHits     = 5
-	colWidthLastSeen = 10
+	colWidthIP         = 18
+	colWidthPort       = 6
+	colWidthHits       = 5
+	colWidthLastSeen   = 10
 	tableHorizOverhead = 12
 	tableVertOverhead  = 8
-	logColIP   = 20
-	logColPort = 6
+	logColIP           = 20
+	logColPort         = 6
 )
 
 type appItem string
@@ -116,10 +116,7 @@ func initialModel() model {
 
 func makeColumns(termWidth int) []table.Column {
 	fixed := colWidthIP + colWidthPort + colWidthHits + colWidthLastSeen
-	domainWidth := termWidth - tableHorizOverhead - fixed
-	if domainWidth < 15 {
-		domainWidth = 15
-	}
+	domainWidth := max(termWidth-tableHorizOverhead-fixed, 15)
 	return []table.Column{
 		{Title: "IP", Width: colWidthIP},
 		{Title: "Port", Width: colWidthPort},

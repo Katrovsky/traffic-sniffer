@@ -74,7 +74,7 @@ func (t *Tracer) scanWinNetstat() {
 		return
 	}
 	seen := map[string]bool{}
-	for _, l := range strings.Split(string(out), "\n") {
+	for l := range strings.SplitSeq(string(out), "\n") {
 		fields := strings.Fields(l)
 		if len(fields) < 5 {
 			continue
@@ -105,7 +105,7 @@ func (t *Tracer) scanLinuxSS() {
 		return
 	}
 	seen := map[string]bool{}
-	for _, l := range strings.Split(string(out), "\n") {
+	for l := range strings.SplitSeq(string(out), "\n") {
 		parts := strings.Fields(l)
 		if len(parts) < 5 {
 			continue
