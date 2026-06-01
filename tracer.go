@@ -11,9 +11,12 @@ import (
 	"time"
 )
 
+const connTTL = 45 * time.Second
+
 type Conn struct {
 	IP        string
 	Port      string
+	Proto     string
 	Domain    string
 	Count     int
 	FirstSeen time.Time
@@ -21,50 +24,72 @@ type Conn struct {
 }
 
 type Tracer struct {
-	AppName     string
-	PIDs        map[int]bool
-	Conns       map[string]*Conn
-	DomainCache map[string]string
-	Procs       []procInfo
-	Mux         sync.RWMutex
+	AppName string
+	Mux     sync.RWMutex
+
+	pids        map[int]bool
+	conns       map[string]*Conn
+	domainCache map[string]string
 }
 
 func newTracer(app string) *Tracer {
 	t := &Tracer{
 		AppName:     app,
-		PIDs:        map[int]bool{},
-		Conns:       map[string]*Conn{},
-		DomainCache: map[string]string{},
+		pids:        map[int]bool{},
+		conns:       map[string]*Conn{},
+		domainCache: map[string]string{},
 	}
-	t.collectPIDs(app)
+	t.refreshPIDs()
 	return t
 }
 
-func (t *Tracer) collectPIDs(app string) {
+func (t *Tracer) refreshPIDs() {
 	procs := listProcesses()
-	t.Procs = procs
+	next := map[int]bool{}
 	for _, p := range procs {
-		if strings.ToLower(p.Name) == app {
-			t.PIDs[p.PID] = true
+		if strings.ToLower(p.Name) == t.AppName {
+			next[p.PID] = true
 		}
 	}
 	changed := true
 	for changed {
 		changed = false
 		for _, p := range procs {
-			if t.PIDs[p.PPID] && !t.PIDs[p.PID] {
-				t.PIDs[p.PID] = true
+			if next[p.PPID] && !next[p.PID] {
+				next[p.PID] = true
 				changed = true
 			}
 		}
 	}
+	t.Mux.Lock()
+	t.pids = next
+	t.Mux.Unlock()
+}
+
+func (t *Tracer) PIDCount() int {
+	t.Mux.RLock()
+	defer t.Mux.RUnlock()
+	return len(t.pids)
 }
 
 func (t *Tracer) scan() {
+	t.refreshPIDs()
 	if runtime.GOOS == "windows" {
 		t.scanWinNetstat()
 	} else {
 		t.scanLinuxSS()
+	}
+	t.evict()
+}
+
+func (t *Tracer) evict() {
+	cutoff := time.Now().Add(-connTTL)
+	t.Mux.Lock()
+	defer t.Mux.Unlock()
+	for k, c := range t.conns {
+		if c.LastSeen.Before(cutoff) {
+			delete(t.conns, k)
+		}
 	}
 }
 
@@ -84,44 +109,65 @@ func (t *Tracer) scanWinNetstat() {
 			continue
 		}
 		pid, err := strconv.Atoi(strings.TrimSpace(fields[len(fields)-1]))
-		if err != nil || !t.PIDs[pid] {
+		if err != nil {
+			continue
+		}
+		t.Mux.RLock()
+		hasPID := t.pids[pid]
+		t.Mux.RUnlock()
+		if !hasPID {
 			continue
 		}
 		host, port := splitAddress(fields[2])
 		if host == "" || isLoopback(host) {
 			continue
 		}
-		key := host + ":" + port
+		key := proto + ":" + host + ":" + port
 		if !seen[key] {
 			seen[key] = true
-			t.add(host, port)
+			t.add(proto, host, port)
 		}
 	}
 }
 
 func (t *Tracer) scanLinuxSS() {
-	out, err := exec.Command("ss", "-tpn").CombinedOutput()
-	if err != nil {
-		return
-	}
 	seen := map[string]bool{}
-	for l := range strings.SplitSeq(string(out), "\n") {
-		parts := strings.Fields(l)
-		if len(parts) < 5 {
+	for _, args := range [][]string{
+		{"-tpn"},
+		{"-upn"},
+	} {
+		out, err := exec.Command("ss", args...).CombinedOutput()
+		if err != nil {
 			continue
 		}
-		pid := extractPidFromSS(l)
-		if pid == 0 || !t.PIDs[pid] {
-			continue
+		proto := "TCP"
+		if args[0] == "-upn" {
+			proto = "UDP"
 		}
-		host, port := splitAddress(parts[4])
-		if host == "" || isLoopback(host) {
-			continue
-		}
-		key := host + ":" + port
-		if !seen[key] {
-			seen[key] = true
-			t.add(host, port)
+		for l := range strings.SplitSeq(string(out), "\n") {
+			parts := strings.Fields(l)
+			if len(parts) < 5 {
+				continue
+			}
+			pid := extractPidFromSS(l)
+			if pid == 0 {
+				continue
+			}
+			t.Mux.RLock()
+			hasPID := t.pids[pid]
+			t.Mux.RUnlock()
+			if !hasPID {
+				continue
+			}
+			host, port := splitAddress(parts[4])
+			if host == "" || isLoopback(host) {
+				continue
+			}
+			key := proto + ":" + host + ":" + port
+			if !seen[key] {
+				seen[key] = true
+				t.add(proto, host, port)
+			}
 		}
 	}
 }
@@ -131,39 +177,36 @@ func isLoopback(host string) bool {
 		host == "::" || host == "::1" || host == "[::1]"
 }
 
-func (t *Tracer) add(ip, port string) {
-	key := ip + ":" + port
+func (t *Tracer) add(proto, ip, port string) {
+	key := proto + ":" + ip + ":" + port
 	now := time.Now()
+
 	t.Mux.Lock()
 	defer t.Mux.Unlock()
-	if c, ok := t.Conns[key]; ok {
+
+	if c, ok := t.conns[key]; ok {
 		c.Count++
 		c.LastSeen = now
-	} else {
-		t.Conns[key] = &Conn{
-			IP:        ip,
-			Port:      port,
-			Domain:    t.resolveAsync(ip),
-			Count:     1,
-			FirstSeen: now,
-			LastSeen:  now,
-		}
+		return
+	}
+
+	domain := t.cachedDomain(ip)
+	t.conns[key] = &Conn{
+		IP:        ip,
+		Port:      port,
+		Proto:     proto,
+		Domain:    domain,
+		Count:     1,
+		FirstSeen: now,
+		LastSeen:  now,
 	}
 }
 
-func (t *Tracer) resetCounters() {
-	t.Mux.Lock()
-	for _, c := range t.Conns {
-		c.Count = 0
-	}
-	t.Mux.Unlock()
-}
-
-func (t *Tracer) resolveAsync(ip string) string {
-	if v, ok := t.DomainCache[ip]; ok {
+func (t *Tracer) cachedDomain(ip string) string {
+	if v, ok := t.domainCache[ip]; ok {
 		return v
 	}
-	t.DomainCache[ip] = "resolving..."
+	t.domainCache[ip] = "resolving..."
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
@@ -173,8 +216,8 @@ func (t *Tracer) resolveAsync(ip string) string {
 			d = strings.TrimSuffix(names[0], ".")
 		}
 		t.Mux.Lock()
-		t.DomainCache[ip] = d
-		for _, c := range t.Conns {
+		t.domainCache[ip] = d
+		for _, c := range t.conns {
 			if c.IP == ip {
 				c.Domain = d
 			}
@@ -182,4 +225,23 @@ func (t *Tracer) resolveAsync(ip string) string {
 		t.Mux.Unlock()
 	}()
 	return "resolving..."
+}
+
+func (t *Tracer) resetCounters() {
+	t.Mux.Lock()
+	for _, c := range t.conns {
+		c.Count = 0
+	}
+	t.Mux.Unlock()
+}
+
+func (t *Tracer) snapshot() map[string]*Conn {
+	t.Mux.RLock()
+	defer t.Mux.RUnlock()
+	cp := make(map[string]*Conn, len(t.conns))
+	for k, v := range t.conns {
+		c := *v
+		cp[k] = &c
+	}
+	return cp
 }

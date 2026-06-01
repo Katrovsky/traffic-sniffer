@@ -28,8 +28,12 @@ func (m model) updateSelect(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.tracer = newTracer(chosen)
 			m.tbl.SetColumns(makeColumns(m.width))
 			m.tbl.SetHeight(m.height - tableVertOverhead)
-			m.openLog(chosen)
-			m.rewriteLogHeader()
+
+			l, err := newLogger(chosen)
+			if err == nil {
+				m.log = l
+			}
+
 			return m, tea.Batch(tickCmd(), scanCmd(m.tracer))
 		}
 	}

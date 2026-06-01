@@ -2,10 +2,7 @@ package main
 
 import (
 	"fmt"
-	"os"
-	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/table"
@@ -27,6 +24,7 @@ type connRow struct {
 	key    string
 	IP     string
 	Port   string
+	Proto  string
 	Domain string
 	Count  int
 	Last   time.Time
@@ -35,12 +33,11 @@ type connRow struct {
 const (
 	colWidthIP         = 18
 	colWidthPort       = 6
+	colWidthProto      = 5
 	colWidthHits       = 5
 	colWidthLastSeen   = 10
-	tableHorizOverhead = 12
+	tableHorizOverhead = 14
 	tableVertOverhead  = 8
-	logColIP           = 20
-	logColPort         = 6
 )
 
 type appItem string
@@ -83,10 +80,7 @@ type model struct {
 	sortBy     int
 	totalConns int
 
-	logPath      string
-	loggedKeys   map[string]bool
-	logFile      *os.File
-	maxDomainLen int
+	log *logger
 
 	startTime time.Time
 	width     int
@@ -103,23 +97,22 @@ func initialModel() model {
 	t.SetStyles(tableStyles())
 
 	return model{
-		phase:        phaseSelect,
-		lst:          newAppList(getApps(), 80, 20),
-		tbl:          t,
-		loggedKeys:   map[string]bool{},
-		startTime:    time.Now(),
-		maxDomainLen: 6,
-		width:        80,
-		height:       24,
+		phase:     phaseSelect,
+		lst:       newAppList(getApps(), 80, 20),
+		tbl:       t,
+		startTime: time.Now(),
+		width:     80,
+		height:    24,
 	}
 }
 
 func makeColumns(termWidth int) []table.Column {
-	fixed := colWidthIP + colWidthPort + colWidthHits + colWidthLastSeen
+	fixed := colWidthIP + colWidthPort + colWidthProto + colWidthHits + colWidthLastSeen
 	domainWidth := max(termWidth-tableHorizOverhead-fixed, 15)
 	return []table.Column{
 		{Title: "IP", Width: colWidthIP},
 		{Title: "Port", Width: colWidthPort},
+		{Title: "Proto", Width: colWidthProto},
 		{Title: "Domain", Width: domainWidth},
 		{Title: "Hits", Width: colWidthHits},
 		{Title: "Last", Width: colWidthLastSeen},
@@ -173,86 +166,42 @@ func (m model) View() string {
 	return ""
 }
 
-func (m *model) openLog(app string) {
-	ts := time.Now().Format("150405_02.01.06")
-	m.logPath = fmt.Sprintf("nettracer_%s_%s.log", app, ts)
-	f, err := os.Create(m.logPath)
-	if err != nil {
-		return
-	}
-	m.logFile = f
-}
-
-func (m *model) rewriteLogHeader() {
-	if m.logFile == nil {
-		return
-	}
-	lineLen := logColIP + 1 + logColPort + 1 + m.maxDomainLen + 1 + 4 + 1 + 8
-	header := fmt.Sprintf("%-*s %-*s %-*s %-4s  %s\n",
-		logColIP, "IP",
-		logColPort, "Port",
-		m.maxDomainLen, "Domain",
-		"Hits",
-		"First seen",
-	)
-	separator := strings.Repeat("─", lineLen) + "\n"
-	m.logFile.Seek(0, 0)
-	m.logFile.WriteString(header)
-	m.logFile.WriteString(separator)
-}
-
-func (m *model) flushLog() {
-	if m.logFile == nil || m.tracer == nil {
-		return
-	}
-	m.tracer.Mux.RLock()
-	defer m.tracer.Mux.RUnlock()
-
-	headerDirty := false
-	for key, c := range m.tracer.Conns {
-		if c.Domain == "resolving..." || m.loggedKeys[key] {
-			continue
-		}
-		if n := utf8.RuneCountInString(c.Domain); n > m.maxDomainLen {
-			m.maxDomainLen = n
-			headerDirty = true
-		}
-	}
-	if headerDirty {
-		m.rewriteLogHeader()
-	}
-
-	for key, c := range m.tracer.Conns {
-		if c.Domain == "resolving..." || m.loggedKeys[key] {
-			continue
-		}
-		fmt.Fprintf(m.logFile, "%-*s %-*s %-*s %-4d  %s\n",
-			logColIP, c.IP,
-			logColPort, c.Port,
-			m.maxDomainLen, c.Domain,
-			c.Count,
-			c.FirstSeen.Format("15:04:05"),
-		)
-		m.loggedKeys[key] = true
-	}
-}
-
-func (m *model) closeLog() {
-	m.flushLog()
-	if m.logFile != nil {
-		m.logFile.Close()
-		m.logFile = nil
-	}
-}
-
 func (m *model) resetForSelect() {
-	m.closeLog()
+	if m.log != nil {
+		m.log.close(m.tracer)
+		m.log = nil
+	}
 	m.tracer = nil
 	m.conns = nil
 	m.totalConns = 0
-	m.loggedKeys = map[string]bool{}
-	m.maxDomainLen = 6
 	m.startTime = time.Now()
 	m.lst = newAppList(getApps(), m.width, m.height-2)
 	m.phase = phaseSelect
+}
+
+func (m *model) logPath() string {
+	if m.log == nil {
+		return ""
+	}
+	return m.log.path
+}
+
+func (m *model) statusLine() string {
+	if m.tracer == nil {
+		return ""
+	}
+	elapsed := time.Since(m.startTime).Round(time.Second)
+	pidCount := m.tracer.PIDCount()
+
+	pidInfo := fmt.Sprintf("%d PID(s)", pidCount)
+	if pidCount == 0 {
+		pidInfo = warnStyle.Render("no PIDs found")
+	}
+
+	return fmt.Sprintf("  %s connections  •  %s  •  %s  •  log: %s",
+		countStyle.Render(fmt.Sprintf("%d", m.totalConns)),
+		dimStyle.Render(elapsed.String()),
+		dimStyle.Render(pidInfo),
+		dimStyle.Render(m.logPath()),
+	)
 }
